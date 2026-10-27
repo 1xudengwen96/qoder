@@ -120,17 +120,19 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> String {
     }
 }
 
-/// 格式化 HTTP 头为字符串
-/// 注意：当前会记录包括 Authorization 在内的所有头部，仅供调试使用。
-/// 生产环境建议配置脱敏选项。
+/// Only transport metadata values may enter diagnostics. Authentication,
+/// cookies, account identifiers and arbitrary custom header values are redacted.
 pub fn format_headers(headers: &hyper::HeaderMap) -> String {
     let mut result = String::new();
     for (name, value) in headers.iter() {
-        if let Ok(v) = value.to_str() {
-            result.push_str(&format!("{}: {}\n", name.as_str(), v));
+        let safe_metadata = matches!(name.as_str(),
+            "content-type" | "content-length" | "content-encoding" | "transfer-encoding");
+        let rendered = if safe_metadata {
+            truncate_str(value.to_str().unwrap_or("<binary>"), 256)
         } else {
-            result.push_str(&format!("{}: <binary>\n", name.as_str()));
-        }
+            "<redacted>".to_string()
+        };
+        result.push_str(&format!("{}: {}\n", name.as_str(), rendered));
     }
     result
 }
@@ -261,5 +263,23 @@ impl TrafficLogger {
 
     pub fn log_path(&self) -> &PathBuf {
         &self.log_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_redact_credentials_and_unknown_header_values() {
+        let mut headers = hyper::HeaderMap::new();
+        for name in ["authorization", "cookie", "set-cookie", "x-api-key", "cosy-key", "cosy-user", "x-custom-secret"] {
+            headers.insert(name, "private-sentinel".parse().unwrap());
+        }
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        let formatted = format_headers(&headers);
+        assert!(!formatted.contains("private-sentinel"));
+        assert!(formatted.contains("authorization: <redacted>"));
+        assert!(formatted.contains("content-type: text/event-stream"));
     }
 }

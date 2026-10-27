@@ -21,10 +21,8 @@ pub async fn start_proxy(state: State<'_, AppState>) -> AppResult<()> {
     let ca_key_path = state.cert_manager.ca_key_path();
     let ca_cert_path = state.cert_manager.ca_cert_path();
 
-    // 如果证书不存在，生成自签名 CA
-    if !ca_key_path.exists() || !ca_cert_path.exists() {
-        generate_ca(&ca_key_path, &ca_cert_path)?;
-    }
+    state.cert_manager.ensure_ca()
+        .map_err(crate::error::AppError::Cert)?;
 
     let ca_key_pem = std::fs::read_to_string(&ca_key_path)
         .map_err(|e| crate::error::AppError::Cert(format!("读取 CA 私钥失败: {}", e)))?;
@@ -92,35 +90,6 @@ pub async fn set_auto_rotate(state: State<'_, AppState>, enabled: bool) -> AppRe
     let mut cfg = state.config.write().await;
     cfg.auto_rotate = enabled;
     cfg.save(&state.config_path).map_err(|e| crate::error::AppError::Config(e))?;
-    Ok(())
-}
-
-fn generate_ca(
-    key_path: &std::path::Path,
-    cert_path: &std::path::Path,
-) -> AppResult<()> {
-    use rcgen::{CertificateParams, KeyPair, IsCa, BasicConstraints, DistinguishedName, DnType};
-
-    let key_pair = KeyPair::generate()
-        .map_err(|e| crate::error::AppError::Cert(format!("生成密钥对失败: {}", e)))?;
-
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, "Qoder Proxy CA");
-    distinguished_name.push(DnType::OrganizationName, "Qoder");
-
-    let mut params = CertificateParams::default();
-    params.distinguished_name = distinguished_name;
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-
-    let cert = params.self_signed(&key_pair)
-        .map_err(|e| crate::error::AppError::Cert(format!("自签名失败: {}", e)))?;
-
-    if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(key_path, key_pair.serialize_pem())?;
-    std::fs::write(cert_path, cert.pem())?;
-
     Ok(())
 }
 

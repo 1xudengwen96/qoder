@@ -50,8 +50,8 @@ impl ProxyServer {
             logger: self.logger.clone(),
             traffic_logger: self.traffic_logger.clone(),
             config: self.config.clone(),
-            last_log_id: Arc::new(tokio::sync::RwLock::new(0)),
-            last_request_is_target: Arc::new(tokio::sync::RwLock::new(false)),
+            last_log_id: None,
+            last_request_is_target: false,
         };
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();

@@ -28,3 +28,11 @@ jobs:
         run: npx --yes pnpm@10.11.0 install --frozen-lockfile
       - name: Build frontend
         run: npx --yes pnpm@10.11.0 build
+  windows-native:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust test toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Test native proxy and certificate initialization
+        run: cargo +1.96.0 test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --lib

@@ -6,6 +6,7 @@
 
 - [完整实施方案](docs/cloud-account-pool-plan.md)
 - [开发进展与验证记录](docs/development-log.md)
+- [剩余工作与交付顺序](docs/remaining-work.md)
 - [协议验证操作与验收](docs/protocol-validation.md)
 - [架构决策](docs/architecture-decisions.md)
 
@@ -44,7 +45,7 @@ Qoder Switch 是一款基于本地 MITM 代理的桌面端工具，通过透明�
 - 批量工作区备份
 
 **流量日志**
-- 完整 HTTP 请求/响应日志（含 Header 与 Body）
+- HTTP 请求/响应元数据日志（认证与自定义头值脱敏，默认不记录正文）
 - 请求域名自动发现与归类
 - 目标域名白名单管理
 
@@ -58,7 +59,7 @@ Qoder Switch 是一款基于本地 MITM 代理的桌面端工具，通过透明�
 
 ### 1. 下载安装
 
-从 [Releases](https://github.com/70548887/Qoder-Switch/releases) 页面下载最新安装包（`.exe`，约 6MB），双击运行 NSIS 安装向导完成安装。
+云端版本尚未发布安装包。后续经过验收的 Windows 安装包将发布到 [本仓库 Releases](https://github.com/1xudengwen96/qoder/releases)；当前可按下方开发指南构建本机版本。
 
 > 系统要求：Windows 10/11 x64
 
