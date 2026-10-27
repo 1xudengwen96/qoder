@@ -1,3 +1,20 @@
+# Qoder 云端号池与桌面客户端
+
+本仓库正在基于 Qoder Switch 开发“云端账号池 + 激活码额度 + Windows 本地代理”产品。客户安装桌面 App、激活卡片，再在受支持的 Qoder 客户端中配置 HTTP 代理。
+
+**当前状态：P0 协议验证阶段。** 现有桌面工具尚未完成云端原生协议、激活码与计费闭环，不应作为可销售的云端版本发布。
+
+- [完整实施方案](docs/cloud-account-pool-plan.md)
+- [开发进展与验证记录](docs/development-log.md)
+- [协议验证操作与验收](docs/protocol-validation.md)
+- [架构决策](docs/architecture-decisions.md)
+
+主仓库：`https://github.com/1xudengwen96/qoder`。原项目历史与 MIT 许可证保留，Git `upstream` 指向原 Qoder Switch 仓库。后续实现、验证结果与阶段交付通过主仓库提交记录持续更新。
+
+以下是继承的本机版功能与开发说明。
+
+---
+
 # Qoder Switch
 
 **Qoder IDE 多账号无感切换与会话管理工具**
