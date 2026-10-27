@@ -1,0 +1,8 @@
+: Synthetic protocol fixture. No live account, credential, or real conversation.
+
+data: {"headers":{},"statusCodeValue":200,"body":"{\"choices\":[{\"delta\":{\"content\":\"synthetic\"}}]}"}
+
+data: {"statusCodeValue":200,"body":"{\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"credits\":0.125,\"billable\":true,\"prompt_tokens_details\":{\"cached_tokens\":40}}}"}
+
+data: [DONE]
+

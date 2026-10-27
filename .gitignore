@@ -16,3 +16,12 @@ releases/
 .claude/
 .qoder/
 记录.md
+
+# Cloud development and private protocol samples
+.local/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example

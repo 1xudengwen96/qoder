@@ -1,0 +1,30 @@
+name: Validate changes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run offline protocol and metering tests
+        run: python3 -m unittest discover -s server/tests -v
+      - name: Check synthetic native SSE fixture
+        run: python3 -m server.qoder_cloud.probe --input server/tests/fixtures/synthetic-native.sse
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install locked frontend dependencies
+        run: npx --yes pnpm@10.11.0 install --frozen-lockfile
+      - name: Build frontend
+        run: npx --yes pnpm@10.11.0 build
