@@ -79,3 +79,68 @@
 剩余工作已完整拆分到 [交付清单](remaining-work.md)。下一阶段是 P0-B Windows 真实协议、证书信任和单次 Credits 验证；本阶段完成不代表云端号池或客户计费已经上线。
 
 本阶段前端构建通过，构建 57 个模块；详细命令与证据边界归档到 [P0-A 验证记录](verification/2026-10-27-p0-a.md)。代码、测试、CI、验收记录与全部后续计划一并同步 `main`。
+
+## 2026-10-27：进度复核与 P0-B 离线准备
+
+进度复核：
+
+- 当前 HEAD 为 `1b7141b`，与 P0-A 代理修复记录一致；`server/` 目前只有离线解析工具，未实现云端服务、账号凭据加密、客户授权、激活码或 PostgreSQL 账本。继承的本地账号管理界面不等于云端客户 App。
+- 只读核对本机安装清单：Qoder IDE 1.37.0 与另一桌面 App 0.4.11 均存在。旧记录中的 0.4.8 不能代表当前 IDE 版本；首发实际产品和区域仍需确定。
+- 历史日志包含 qodercli 流量，api2 / api3 / repo2 作为候选入口记录在 [协议验收手册](protocol-validation.md)，未判定 IDE 已兼容。撤回本轮临时自动扩域名 / 迁移配置改动，默认 TLS 解密范围与用户配置保持原状。
+- 当前 Windows shell PATH 的 Python 指向 WindowsApps 占位入口，但专用文件搜索找到了已有 uv 管理的 Python 3.13.3，通过绝对路径执行；未安装或更改系统工具链。
+
+本批实现：
+
+- 显式 `--content-encoding identity/gzip/deflate`。单成员 gzip、带 zlib 包装的 deflate 增量解码，原始输入与解压输出各限制 64 MiB；拒绝校验和错误、截断、多成员 / 尾随数据和未知编码。
+- 报告 v2 新增编码、输入 / 解压字节数、流结束判定与待核对原因。完整 usage 事件后无 `[DONE]` 的 SSE 不再退出 0；不完整尾部、用量快照回退同样退出 2，已有快照仅为观测值。
+- 增加 25 项人工数据回归；协议测试共 50 项通过，含压缩拆包、大小边界、压缩炸弹、结束判定、文件 / stdin CLI 和脱敏。原 SSE 夹具仍为 0.125 Credits（125000 微积分），`diagnostic_only: true`。
+- CI 配置扩展为 Windows / Ubuntu × Python 3.10 / 3.13。尚未核验远端运行状态，不把配置完成写成远端测试通过。
+
+本机可复现命令（仓库根目录，使用已核验的 Python 路径）：
+
+```powershell
+& "$env:APPDATA\uv\python\cpython-3.13.3-windows-x86_64-none\python.exe" -m unittest discover -s server/tests -v
+& "$env:APPDATA\uv\python\cpython-3.13.3-windows-x86_64-none\python.exe" -m server.qoder_cloud.probe --input server/tests/fixtures/synthetic-native.sse
+```
+
+边界：未安装信任证书、未修改真实 IDE / 账号配置、未调用上游对话或核对官方扣费；本批未修改 Rust / 前端，未重跑其构建。P0-B 实机验收仍未通过，P1–P5 尚未交付。本批改动留在工作区，未提交或推送。
+
+## 2026-10-28：恢复任务与本机 P0-B 证据复核
+
+- Git HEAD 仍为 `1b7141b`；P0-B 离线解析、CI 和文档修改尚未提交，另有未跟踪的 `server/qoder_cloud/windows_p0.py`。不将工作区改动当成已发布版本。
+- 上轮未归档的 `.local/windows-p0/certificate-status.json` 已记录独立测试 CA 安装。此次只读按 SHA-256 精确指纹在 Windows ROOT 中重新确认其存在，没有再次安装、删除或替换证书。
+- 使用真实安装的 `E:\Qoder IDE\Qoder IDE.exe`，重跑 `tls-check`。15888 → 15889 的 loopback CONNECT 和 Windows 默认 CA TLS 通过；IDE 的 Node 默认报 `UNABLE_TO_VERIFY_LEAF_SIGNATURE`，仅在独立子进程设置 `NODE_USE_SYSTEM_CA=1` 时授权通过。未修改现用 IDE 环境或配置。
+- 上述是 Python loopback 辅助代理与 Electron Node TLS 栈测试，不是 Rust 代理到 IDE 的正常对话，也不能证明 Chromium、原生 Qoder 进程或工具调用链均信任该 CA。P0-01 / P0-02 仍未完成端到端验收。
+- 只读账号盘点找到加密存储，但没有验证出可用测试凭据；`candidate_count: 0`、`read_only_checks: []`。未刷新 Token、未导入账号、未请求上游推理，不能将容器存在当成可用账号。
+- 人工新增诊断用例复现：`decode_ide_secret()` 的无 BOM UTF-16LE 判断切片取得 4 个字节，却与 3 个零字节比较，因此该分支不成立。这不解释 DPAPI 解密本身失败；两类问题需要分别验证。
+- Windows 工具改进的文件编辑停在 IDE 保存确认阶段，尚未获得落盘确认；未重复覆盖该待保存文件。依赖该改进的临时测试已撤回，原有 50 项协议测试重新通过，`git diff --check` 通过。新增诊断回归未交付。
+
+恢复后的顺序：先确认原编辑操作与所有保存已停止，再由用户执行 `Chat: Recover Pending File Edit` 恢复编辑确认；随后核对实际文件并完成编码识别、隔离账号来源、退出状态与连接清理的回归。再在独立 IDE 测试目录通过本机授权准备可用测试账号，执行最小对话、原生响应采样和官方扣费核对。不得修改当前会话或把 Token 发到聊天中。
+
+本轮只完成上述复核与记录，未提交 / 推送，未重跑 Rust / 前端构建，P1–P5 仍未开始。
+
+## 2026-10-28：用户不在场时继续独立离线开发
+
+执行约定：缺账号、样本、设备或人工操作的测试本轮跳过，其他可独立工作继续执行，不等待常规方案选择。跳过不等于通过；已观察到的 IDE Node 默认信任失败仍保留，P0 真实链路是上线门槛。
+
+本批实际落盘：
+
+- `protocol.py` 拒绝重复 JSON 键和转义同名键；JSON 结构在解析前限 64 层，避免依赖不同 Python 版本的递归限制。极端 Decimal 指数统一为安全 `ProtocolError`，调用者关闭 Decimal trap 时也拒绝非有限解析结果。
+- SSE 按真实 CR / LF / CRLF 与 UTF-8 字节计入事件限额；补裸 data 字段、结束后的空事件、EOF 注释 / 未知字段和信封结束标记深度判定。
+- 非 2xx 原生信封不会被视为成功。显式 null 用量清除旧快照；累计高水位检测跨部分 / 缺失字段，覆盖 Credits、输入、输出、总、缓存与推理 Token。较早的无效用量与回退不会因后来有效快照而消失。
+- `usage.py` 实现精确整数微积分核对，`probe.py` 提供 `--official-credits` 与 `--summary`。不访问官方 API、不读取账号、不修改余额；人工数字一致仍标记 `manual_unverified`、`request_correlation_verified: false`、`diagnostic_only: true`。
+- 不一致、缺失或未确认样本退出 2；非法数值和解析错误退出 1，不输出私人字段、路径或 traceback。stdout 保持单份 JSON，摘要仅在 stderr，已有输出拒绝覆盖。
+- 新增 45 项自动回归，协议测试累计 95 项；包含固定种子的 90 种编码 / 换行 / 拆包组合。CI 增加人工 SSE 的离线官方数字核对步骤，未声称远端运行通过。
+- 更新工具说明、任务清单和 [人工测试登记](protocol-validation.md)。没有以空测试或 synthetic 数据代替真实验收；Windows 工具待保存编辑本轮跳过，不再次读取或覆盖该文件。
+
+验证命令（仓库根目录）：
+
+```powershell
+& ".local\p0-venv\Scripts\python.exe" -m unittest discover -s server/tests -v
+& ".local\p0-venv\Scripts\python.exe" -m server.qoder_cloud.probe --input server/tests/fixtures/synthetic-native.sse --official-credits 0.125 --summary
+& "$env:APPDATA\uv\python\cpython-3.13.3-windows-x86_64-none\python.exe" -S -W error -m unittest discover -s server/tests -q
+```
+
+验证结果：Windows Python 3.13.3 下 95 项自动测试全部通过；再次禁用 site 自动加载并将警告视为错误运行，仍为 95 项通过。`git diff --check` 无错误。编辑器语言服务未就绪，未把静态诊断记为通过；远端 CI 与其他 Python / OS 组合仍以实际运行结果为准。
+
+人工夹具核对返回 `matched`、差额 0、125000 微积分，仍仅诊断。真实对话、原生路由、官方逐笔消耗、无账号初始化与跨客户隔离留待有资源时验证；所需条件与步骤已集中登记。没有触碰当前会话、账号、代理或证书，未提交 / 推送。本批不修改 Rust / 前端，也不把 P1–P5 标成完成。

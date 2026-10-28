@@ -114,3 +114,24 @@ def normalize_usage(data: Any) -> UsageSnapshot:
     if cached is not None and prompt is not None and cached > prompt:
         raise InvalidUsage("cached tokens exceed prompt tokens")
     return UsageSnapshot(credits, prompt, completion, cached, reasoning, total, billable)
+
+
+def compare_credits(observed_micro: int | None, official_credits: Any, *, sample_ready: bool) -> dict:
+    """离线核对手工提供的同笔官方消耗；数字一致不代表身份或请求归属已验证。"""
+    observed = _counter(observed_micro, "observed_credits_micro")
+    official = _credits(official_credits)
+    if official is None or not isinstance(sample_ready, bool):
+        raise InvalidUsage("official comparison requires a value and sample state")
+    difference = observed - official if observed is not None else None
+    if observed is None:
+        state = "credits_missing"
+    elif not sample_ready:
+        state = "sample_unconfirmed"
+    elif difference == 0:
+        state = "matched"
+    else:
+        state = "mismatch"
+    return {"state": state, "official_credits_micro": official,
+            "observed_credits_micro": observed, "difference_micro": difference,
+            "official_value_source": "manual_unverified", "request_correlation_verified": False,
+            "diagnostic_only": True}
