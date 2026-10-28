@@ -43,8 +43,25 @@ pub struct FetchedAccount {
     pub quota: Option<u64>,
 }
 
+/// 账号池地址未配置时的提示。使用方必须自己部署账号池，不允许回退到任何内置地址。
+pub const POOL_URL_NOT_CONFIGURED: &str =
+    "账号池地址未配置：请在设置中填写你自建的账号池接口，例如 https://pool.example.com/api/fetch-account";
+
+/// 校验账号池地址。空值直接拒绝，避免把卡密发往未指定的主机。
+pub fn validate_api_url(api_url: &str) -> Result<&str, String> {
+    let trimmed = api_url.trim();
+    if trimmed.is_empty() {
+        return Err(POOL_URL_NOT_CONFIGURED.to_string());
+    }
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err(format!("账号池地址必须以 http:// 或 https:// 开头：{trimmed}"));
+    }
+    Ok(trimmed)
+}
+
 /// 从账号池获取账号
 pub async fn fetch_account(secret_key: &str, api_url: &str) -> Result<FetchedAccount, String> {
+    let api_url = validate_api_url(api_url)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -88,4 +105,43 @@ pub async fn fetch_account(secret_key: &str, api_url: &str) -> Result<FetchedAcc
         machine_type: data.machine_type,
         quota: user_info.quota,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_pool_url_is_rejected() {
+        for blank in ["", "   ", "\t"] {
+            let error = validate_api_url(blank).unwrap_err();
+            assert!(error.contains("未配置"), "{blank:?} -> {error}");
+        }
+    }
+
+    #[test]
+    fn pool_url_without_scheme_is_rejected() {
+        for bad in ["pool.example.com/api/fetch-account", "ftp://pool.example.com", "pool.example.com"] {
+            let error = validate_api_url(bad).unwrap_err();
+            assert!(error.contains("http://"), "{bad} -> {error}");
+        }
+    }
+
+    #[test]
+    fn pool_url_is_trimmed_and_accepted() {
+        assert_eq!(
+            validate_api_url("  https://pool.example.com/api/fetch-account  ").unwrap(),
+            "https://pool.example.com/api/fetch-account"
+        );
+        assert_eq!(
+            validate_api_url("http://127.0.0.1:9000/api").unwrap(),
+            "http://127.0.0.1:9000/api"
+        );
+    }
+
+    #[test]
+    fn default_config_does_not_point_at_a_third_party_pool() {
+        let config = crate::config::ProxyConfig::default();
+        assert!(config.account_pool_url.is_empty());
+    }
 }
