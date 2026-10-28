@@ -7,6 +7,7 @@
 import argparse
 import base64
 import ctypes
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,7 @@ import subprocess
 import threading
 import uuid
 from urllib import error as urlerror, request as urlrequest
+from urllib.parse import urlsplit
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = WORKSPACE / ".local" / "windows-p0"
@@ -332,7 +334,8 @@ def account_inventory(root: Path):
     summary = {"source": "ide_state_database", "exists": database.exists(), "credential_entries": 0,
                "auth_entries": 0, "usable_credential_verified": False}
     if database.exists():
-        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        # 只读打开；closing 确保退出时释放文件句柄，避免长时间占用现用 IDE 数据库。
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
             for key, value in connection.execute("SELECT key, value FROM ItemTable"):
                 if key.startswith("secret://"):
                     summary["credential_entries"] += 1
@@ -376,9 +379,66 @@ def account_inventory(root: Path):
     return status
 
 
-def decode_ide_secret(value, metadata=None):
-    """识别 Electron Windows safeStorage 容器，使用当前用户 DPAPI；不刷新凭据。"""
-    container = json.loads(value)
+def secret_text(clear: bytes):
+    """还原 safeStorage 容器文本，返回 (文本, 编码名)；只用显式识别，不做静默替换。"""
+    if clear.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return clear.decode("utf-16"), "utf-16"
+    # Electron 部分版本写入无 BOM 的 UTF-16LE：ASCII 正文字节的高位字节为 0x00，
+    # 因此判断依据必须是奇偶字节的 NUL 分布，不能对固定切片做定长比较。
+    if len(clear) >= 8 and len(clear) % 2 == 0:
+        odd_nulls = clear[1::2].count(0)
+        even_nulls = clear[0::2].count(0)
+        if odd_nulls > len(clear) // 4 and even_nulls < odd_nulls // 2:
+            return clear.decode("utf-16-le"), "utf-16-le"
+    return clear.decode("utf-8-sig"), "utf-8-sig"
+
+
+def os_crypt_key(source: Path) -> bytes:
+    """读取 Chromium os_crypt 密钥：Local State 里的 DPAPI 包装的 32 字节密钥。"""
+    state_path = source / "Local State"
+    if not state_path.is_file():
+        raise ValidationError("未找到 os_crypt 状态文件")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError):
+        raise ValidationError("os_crypt 状态文件不可解析") from None
+    section = state.get("os_crypt") if isinstance(state, dict) else None
+    encoded = section.get("encrypted_key") if isinstance(section, dict) else None
+    if not isinstance(encoded, str):
+        raise ValidationError("os_crypt 密钥缺失")
+    try:
+        wrapped = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        raise ValidationError("os_crypt 密钥编码无效") from None
+    if not wrapped.startswith(b"DPAPI"):
+        raise ValidationError("os_crypt 密钥不是当前用户 DPAPI 包装")
+    material = dpapi(wrapped[len(b"DPAPI"):], decrypt=True)
+    if len(material) != 32:
+        raise ValidationError("os_crypt 密钥长度异常")
+    return material
+
+
+def os_crypt_decrypt(blob: bytes, source: Path) -> bytes:
+    """按 Chromium 的 v10 格式（12 字节 nonce + 密文 + tag）解密。"""
+    try:
+        from cryptography.exceptions import InvalidTag
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        raise ValidationError("缺少隔离环境中的 cryptography 依赖") from None
+    if len(blob) <= 12:
+        raise ValidationError("账号容器密文长度异常")
+    try:
+        return AESGCM(os_crypt_key(source)).decrypt(blob[:12], blob[12:], None)
+    except (InvalidTag, ValueError, OSError):
+        raise ValidationError("DPAPI 解密失败且 os_crypt 密钥不匹配") from None
+
+
+def decode_ide_secret(value, metadata=None, key_source=None):
+    """识别 Electron Windows safeStorage 容器，使用当前用户 DPAPI 或 os_crypt 密钥；不刷新凭据。"""
+    try:
+        container = json.loads(value)
+    except (ValueError, UnicodeError):
+        raise ValidationError("未知账号容器") from None
     if metadata is not None:
         metadata["container_json"] = True
     if not isinstance(container, dict) or container.get("type") != "Buffer":
@@ -388,19 +448,28 @@ def decode_ide_secret(value, metadata=None):
             isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 255 for item in items):
         raise ValidationError("无效账号容器")
     encrypted = bytes(items)
+    # 两种容器共存：Electron 自己直接 DPAPI；VS Code / Chromium 系为 v10 + AES-GCM，
+    # 密钥由 Local State 中的 DPAPI 包装。先试纯 DPAPI，失败再走 os_crypt。
+    clear = None
+    scheme = "dpapi"
     if encrypted.startswith(b"v10"):
-        encrypted = encrypted[3:]
-    clear = dpapi(encrypted, decrypt=True)
+        body = encrypted[3:]
+        try:
+            clear = dpapi(body, decrypt=True)
+        except ValidationError:
+            if key_source is None:
+                raise
+            clear = os_crypt_decrypt(body, key_source)
+            scheme = "os_crypt_aes_gcm"
+    else:
+        clear = dpapi(encrypted, decrypt=True)
+    # Electron Windows safeStorage 的版本差异：UTF-16（含 / 不含 BOM）与 UTF-8 容器都需显式识别。
+    text, encoding = secret_text(clear)
     if metadata is not None:
+        metadata["container_scheme"] = scheme
         metadata["dpapi_decrypted_bytes"] = len(clear)
         metadata["utf16_bom"] = clear.startswith((b"\xff\xfe", b"\xfe\xff"))
-    # Electron Windows safeStorage 的版本差异：UTF-16LE 与 UTF-8 容器都需显式识别。
-    if clear.startswith((b"\xff\xfe", b"\xfe\xff")):
-        text = clear.decode("utf-16")
-    elif len(clear) % 2 == 0 and clear[1:8:2] == b"\x00\x00\x00":
-        text = clear.decode("utf-16-le")
-    else:
-        text = clear.decode("utf-8-sig")
+        metadata["decoded_encoding"] = encoding
     try:
         return json.loads(text)
     except ValueError:
@@ -449,84 +518,303 @@ def read_account_endpoint(token, endpoint):
             except (ValueError, UnicodeError):
                 return {"http_status": incoming.status, "valid_json": False}, None
     except urlerror.HTTPError as failure:
+        # HTTPError 同时是文件对象，显式关闭后才能释放句柄。
+        failure.close()
         return {"http_status": failure.code, "valid_json": False}, None
     except (OSError, urlerror.URLError):
         return {"http_status": None, "valid_json": False, "network_error": True}, None
 
 
-def account_check(root: Path):
+def modification_time(path: Path) -> float:
+    """容器最后写入时间；取不到时按最旧处理，不阻断盘点。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def iso_mtime(path: Path):
+    moment = modification_time(path)
+    if not moment:
+        return None
+    return datetime.fromtimestamp(moment, timezone.utc).isoformat(timespec="seconds")
+
+
+def count_files(root: Path, limit=50000) -> int:
+    """统计数据目录文件数，只用于区分“在用”与“残留”目录；不读内容。"""
+    total = 0
+    try:
+        for entry in os.scandir(root):
+            if total >= limit:
+                break
+            if entry.is_dir(follow_symlinks=False):
+                total += count_files(Path(entry.path), limit - total)
+            elif entry.is_file(follow_symlinks=False):
+                total += 1
+    except OSError:
+        return total
+    return total
+
+
+def desktop_auth_containers():
+    """枚举桌面 App 的独立凭据容器，只读，不刷新。"""
+    appdata = Path(os.environ["APPDATA"])
+    found = []
+    for label in ("com.qoder.app.stable", "com.qodercn.app.stable"):
+        source = appdata / label
+        path = source / "auth.v1.dat"
+        if path.is_file():
+            found.append((label, source, path))
+    return found
+
+
+def decode_desktop_auth(source: Path, path: Path):
+    """按 v10 + os_crypt 解密桌面 App 凭据容器，返回 (快照, 元数据)。"""
+    blob = path.read_bytes()
+    if not blob.startswith(b"v10"):
+        raise ValidationError("未知账号容器")
+    text, encoding = secret_text(os_crypt_decrypt(blob[3:], source))
+    try:
+        snapshot = json.loads(text)
+    except ValueError:
+        raise ValidationError("未知已解密账号格式") from None
+    metadata = {"container_scheme": "os_crypt_aes_gcm", "decoded_encoding": encoding,
+                "dpapi_decrypted_bytes": len(blob) - 3}
+    return snapshot, metadata
+
+
+SOURCE_PRIORITY = ("com.qoder.app.stable", "com.qodercn.app.stable", "ide_secret")
+
+
+def candidate_rank(snapshot_item):
+    """同一身份有多个副本时的排序键：字段更完整 > 最近写入 > 来源顺序。
+
+    字段完整度优先，因为要留档的是能复用的那份；同等完整度时看写入时间，
+    较新的副本刷新令牌更可能仍有效；最后才用固定来源顺序兜底。
+    不比较不同种类的修改时间：IDE 数据库会被频繁重写，其 mtime 不代表密钥新鲜度。
+    """
+    _, snapshot, label, modified = snapshot_item
+    richness = len(snapshot) if isinstance(snapshot, dict) else 0
+    order = SOURCE_PRIORITY.index(label) if label in SOURCE_PRIORITY else len(SOURCE_PRIORITY)
+    return (-richness, -modified, order)
+
+
+def select_candidate(snapshots, requested=""):
+    """选出唯一待验证快照，返回 (快照四项组, 阻塞原因)。
+
+    同一 token 出现在多个容器里属于同一身份的冗余副本，可以去重后验证；
+    不同 token 代表不同登录身份，没有明确指定来源时一律不验证。
+    """
+    if requested:
+        for item in snapshots:
+            if item[2] == requested:
+                return item, None
+        return None, "requested_source_not_available"
+    groups = {}
+    for item in snapshots:
+        groups.setdefault(item[0], []).append(item)
+    if len(groups) != 1:
+        return None, "multiple_distinct_identities"
+    return min(next(iter(groups.values())), key=candidate_rank), None
+
+
+def verify_candidate(root: Path, status: dict, token: str, snapshot):
+    """只读校验计划与配额；成功后把快照单独加密留档，不改现用登录。"""
+    plan, payload = read_account_endpoint(token, "https://openapi.qoder.sh/api/v2/user/plan")
+    status["read_only_checks"].append({"endpoint": "user_plan", **plan})
+    data = payload.get("data", payload) if isinstance(payload, dict) else None
+    verified = plan.get("http_status") == 200 and isinstance(data, dict) and any(
+        field in data for field in ("plan_tier_name", "planTierName", "user_type", "userType"))
+    if not verified:
+        return
+    quota, quota_payload = read_account_endpoint(token, "https://openapi.qoder.sh/api/v2/quota/usage")
+    status["read_only_checks"].append({"endpoint": "quota_usage", **quota})
+    qdata = quota_payload.get("data", quota_payload) if isinstance(quota_payload, dict) else None
+    user_quota = qdata.get("userQuota") if isinstance(qdata, dict) else None
+    if isinstance(user_quota, dict):
+        from .usage import normalize_usage, InvalidUsage
+        remaining = user_quota.get("remaining")
+        try:
+            if remaining is not None:
+                status["upstream_remaining_micro"] = normalize_usage({"credits": str(remaining)}).credits_micro
+        except InvalidUsage:
+            status["upstream_remaining_micro"] = None
+    # 独立测试快照受 DPAPI 保护，现用 IDE 的原始登录记录完全不变。
+    protect_directory(root)
+    protected = dpapi(json.dumps(snapshot, ensure_ascii=False).encode())
+    account_path = root / "account-snapshot.dpapi"
+    if not account_path.exists():
+        write_new(account_path, protected)
+        status["account_imported"] = True
+    status["usable_credential_verified"] = True
+
+
+def account_check(root: Path, requested_source: str = ""):
     database = Path(os.environ["APPDATA"]) / "Qoder/User/globalStorage/state.vscdb"
     status = {"diagnostic_only": True, "existing_login_modified": False, "token_refreshed": False,
               "account_imported": False, "usable_credential_verified": False, "upstream_inference_requests": 0,
               "recognized_qoder_secret": False, "read_only_checks": []}
-    if not database.exists():
-        report(root, "account-check.json", status)
-        return status
     snapshots = []
-    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
-        for key, value in connection.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'secret://%'"):
-            try:
-                descriptor = json.loads(key[len("secret://"):])
-                if not str(descriptor.get("extensionId", "")).startswith("aicoding."):
+    # IDE 数据库可能不存在；桌面 App 的容器仍可独立检查。
+    if database.exists():
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+            for key, value in connection.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'secret://%'"):
+                # 描述或扩展名不属 Qoder 时直接跳过：非目标容器不得参与状态判定，
+                # 否则一行畸形记录会掩盖真正的 Qoder 容器。
+                try:
+                    descriptor = json.loads(key[len("secret://"):])
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(descriptor, dict) or not str(descriptor.get("extensionId", "")).startswith("aicoding."):
                     continue
                 status["recognized_qoder_secret"] = True
                 metadata = {}
                 status["safe_decode_metadata"] = metadata
-                snapshot = decode_ide_secret(value, metadata)
-                status["decoded_qoder_container_type"] = type(snapshot).__name__
-                if isinstance(snapshot, dict):
-                    fields = {"token", "access_token", "accessToken", "security_oauth_token", "securityOauthToken",
-                              "auth", "account", "session", "data", "user", "credentials", "credential"}
-                    status["recognized_account_fields"] = sorted(fields.intersection(snapshot))
-                token = extract_token(snapshot)
-                if token:
-                    snapshots.append((token, snapshot))
-            except ValidationError as failure:
-                status["secret_decode_state"] = "dpapi_failed" if "DPAPI" in str(failure) else "unsupported_container"
-            except UnicodeError:
-                status["secret_decode_state"] = "decrypted_secret_not_text"
-            except (ValueError, TypeError) as failure:
-                status["secret_decode_state"] = "decoded_content_not_supported_json"
-                status["safe_failure_type"] = type(failure).__name__
-    status["candidate_count"] = len(snapshots)
-    # 不自动选择多个登录快照，避免对不明账号执行验证。
-    if len(snapshots) == 1:
-        token, snapshot = snapshots[0]
-        plan, payload = read_account_endpoint(token, "https://openapi.qoder.sh/api/v2/user/plan")
-        status["read_only_checks"].append({"endpoint": "user_plan", **plan})
-        data = payload.get("data", payload) if isinstance(payload, dict) else None
-        verified = plan.get("http_status") == 200 and isinstance(data, dict) and any(
-            field in data for field in ("plan_tier_name", "planTierName", "user_type", "userType"))
-        if verified:
-            quota, quota_payload = read_account_endpoint(token, "https://openapi.qoder.sh/api/v2/quota/usage")
-            status["read_only_checks"].append({"endpoint": "quota_usage", **quota})
-            qdata = quota_payload.get("data", quota_payload) if isinstance(quota_payload, dict) else None
-            user_quota = qdata.get("userQuota") if isinstance(qdata, dict) else None
-            if isinstance(user_quota, dict):
-                from .usage import normalize_usage, InvalidUsage
-                remaining = user_quota.get("remaining")
                 try:
-                    if remaining is not None:
-                        status["upstream_remaining_micro"] = normalize_usage({"credits": str(remaining)}).credits_micro
-                except InvalidUsage:
-                    status["upstream_remaining_micro"] = None
-            # 独立测试快照受 DPAPI 保护，现用 IDE 的原始登录记录完全不变。
-            protect_directory(root)
-            protected = dpapi(json.dumps(snapshot, ensure_ascii=False).encode())
-            account_path = root / "account-snapshot.dpapi"
-            if not account_path.exists():
-                write_new(account_path, protected)
-                status["account_imported"] = True
-            status["usable_credential_verified"] = True
+                    snapshot = decode_ide_secret(value, metadata, database.parents[2])
+                    status["decoded_qoder_container_type"] = type(snapshot).__name__
+                    if isinstance(snapshot, dict):
+                        fields = {"token", "access_token", "accessToken", "security_oauth_token",
+                                  "securityOauthToken", "auth", "account", "session", "data", "user",
+                                  "credentials", "credential"}
+                        status["recognized_account_fields"] = sorted(fields.intersection(snapshot))
+                    token = extract_token(snapshot)
+                    if token:
+                        snapshots.append((token, snapshot, "ide_secret", modification_time(database)))
+                except ValidationError as failure:
+                    reason = str(failure)
+                    if "DPAPI" in reason:
+                        status["secret_decode_state"] = "dpapi_failed"
+                    elif "已解密" in reason:
+                        status["secret_decode_state"] = "decoded_content_not_supported"
+                    else:
+                        status["secret_decode_state"] = "unsupported_container"
+                except UnicodeError:
+                    status["secret_decode_state"] = "decrypted_secret_not_text"
+                except (ValueError, TypeError) as failure:
+                    status["secret_decode_state"] = "unsupported_container"
+                    status["safe_failure_type"] = type(failure).__name__
+    # 桌面 App 的独立容器：与 IDE 互不影响，只用同级 Local State 的 os_crypt 密钥只读解密。
+    for label, source, path in desktop_auth_containers():
+        entry = {"source": label, "exists": True, "usable_credential_verified": False}
+        status.setdefault("desktop_auth_containers", []).append(entry)
+        try:
+            snapshot, metadata = decode_desktop_auth(source, path)
+        except ValidationError as failure:
+            entry["decode_state"] = "dpapi_failed" if "DPAPI" in str(failure) else "unsupported_container"
+            continue
+        except (ValueError, UnicodeError):
+            entry["decode_state"] = "decoded_content_not_supported"
+            continue
+        entry["decode_metadata"] = metadata
+        entry["decoded_container_type"] = type(snapshot).__name__
+        if isinstance(snapshot, dict):
+            fields = {"token", "refreshToken", "user", "expiresAt", "schemaVersion", "authenticationContext"}
+            entry["recognized_account_fields"] = sorted(fields.intersection(snapshot))
+        token = extract_token(snapshot)
+        entry["token_extractable"] = bool(token)
+        entry["data_directory_files"] = count_files(source)
+        if token:
+            entry["container_modified_at"] = iso_mtime(path)
+            snapshots.append((token, snapshot, label, modification_time(path)))
+    status["candidate_count"] = len(snapshots)
+    status["candidate_sources"] = [label for _, _, label, _ in snapshots]
+    status["distinct_identity_count"] = len({token for token, _, _, _ in snapshots})
+    chosen, blocked = select_candidate(snapshots, requested_source)
+    if blocked:
+        # 不自动挑选不同身份的登录快照；阻塞原因是固定文案，可用 --source 显式指定。
+        status["verification_blocked"] = blocked
+    else:
+        token, snapshot, source_label, _ = chosen
+        status["verified_source"] = source_label
+        verify_candidate(root, status, token, snapshot)
+        if status["usable_credential_verified"]:
+            # 容器条目只标记实际通过只读校验的那一个来源。
+            for entry in status.get("desktop_auth_containers", []):
+                entry["usable_credential_verified"] = entry["source"] == source_label
     report(root, "account-check.json", status)
+    return status
+
+
+# 代理默认解密范围；与 src-tauri/src/config.rs 的 DEFAULT_TARGET_DOMAINS 保持同一份，
+# 跨语言一致性由 EndpointCheckTests 守住。
+DEFAULT_TARGET_DOMAINS = ("center.qoder.sh", "openapi.qoder.sh", "api3.qoder.sh", "api5.qoder.com.cn")
+REGION_NODE_ROLES = {"preferredInferenceNode": "inference",
+                     "preferredNesNode": "nes",
+                     "preferredCodebaseNode": "codebase"}
+BILLED_ROLES = ("inference", "nes")
+REGION_CACHE_MAX_AGE = 1800
+
+
+def endpoint_host(value):
+    """从区域配置的 endpoint 取出主机名；只接受 https，取不到时返回空串。"""
+    if not isinstance(value, str):
+        return ""
+    parts = urlsplit(value.strip())
+    if parts.scheme != "https" or not parts.hostname:
+        return ""
+    host = parts.hostname.lower()
+    return host if re.fullmatch(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?", host) else ""
+
+
+def region_cache_nodes(cache: Path):
+    """读取 IDE 区域配置缓存里的节点，返回 (节点列表, 取数时间)；不读任何身份信息。"""
+    try:
+        value = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return [], None
+    content = value.get("content") if isinstance(value, dict) else None
+    nodes = []
+    for key, role in REGION_NODE_ROLES.items():
+        item = content.get(key) if isinstance(content, dict) else None
+        endpoint = item.get("endpoint") if isinstance(item, dict) else None
+        host = endpoint_host(endpoint)
+        nodes.append({"node": key, "role": role, "host": host,
+                      "billed": role in BILLED_ROLES, "in_default_scope": host in DEFAULT_TARGET_DOMAINS})
+    fetched = value.get("fetchTime") if isinstance(value, dict) else None
+    moment = None
+    if isinstance(fetched, (int, float)) and not isinstance(fetched, bool) and fetched > 0:
+        moment = datetime.fromtimestamp(fetched / 1000, timezone.utc)
+    return nodes, moment
+
+
+def endpoint_check(root: Path, cache: Path = None):
+    """只读核对 IDE 区域节点与默认解密范围；只报告漂移，不改任何配置。"""
+    path = cache or Path(os.environ["APPDATA"]) / "Qoder/User/region-config-cache.json"
+    status = {"diagnostic_only": True, "region_cache_present": path.is_file(),
+              "default_target_domains": list(DEFAULT_TARGET_DOMAINS), "nodes": [],
+              "missing_billing_domains": [], "unbilled_domains_in_scope": [],
+              "suggested_target_domains": list(DEFAULT_TARGET_DOMAINS),
+              "within_default_scope": None, "region_cache_fetched_at": None,
+              "region_cache_age_seconds": None, "region_cache_stale": None,
+              "existing_login_modified": False}
+    if status["region_cache_present"]:
+        nodes, fetched = region_cache_nodes(path)
+        status["nodes"] = nodes
+        billed = [item["host"] for item in nodes if item["billed"] and item["host"]]
+        unbilled = {item["host"] for item in nodes if not item["billed"] and item["host"]}
+        status["missing_billing_domains"] = [host for host in billed if host not in DEFAULT_TARGET_DOMAINS]
+        status["unbilled_domains_in_scope"] = [host for host in DEFAULT_TARGET_DOMAINS if host in unbilled]
+        # 建议名单保持默认顺序，只在尾部追加漂移出来的计费节点，方便直接与 config.rs 比对。
+        status["suggested_target_domains"] = list(DEFAULT_TARGET_DOMAINS) + status["missing_billing_domains"]
+        status["within_default_scope"] = not status["missing_billing_domains"]
+        if fetched is not None:
+            status["region_cache_fetched_at"] = fetched.isoformat(timespec="seconds")
+            status["region_cache_age_seconds"] = max(0, int((datetime.now(timezone.utc) - fetched).total_seconds()))
+            # 缓存超过刷新周期说明 IDE 近期没联网，节点名单可能已经过时。
+            status["region_cache_stale"] = status["region_cache_age_seconds"] > REGION_CACHE_MAX_AGE
+    report(root, "endpoint-check.json", status)
     return status
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Windows 独立 P0 证书及账号验证；不修改现用 IDE")
-    parser.add_argument("action", choices=("prepare", "install", "tls-check", "account-inventory", "account-check"))
+    parser.add_argument("action", choices=("prepare", "install", "tls-check", "account-inventory", "account-check",
+                                            "endpoint-check"))
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--electron", default="")
+    parser.add_argument("--source", default="",
+                        help="account-check 待验证的凭据来源；多身份并存时必填")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     if not root.is_relative_to(WORKSPACE / ".local"):
@@ -539,7 +827,9 @@ def main(argv=None):
         elif args.action == "tls-check":
             value = tls_check(root, args.electron)
         elif args.action == "account-check":
-            value = account_check(root)
+            value = account_check(root, args.source)
+        elif args.action == "endpoint-check":
+            value = endpoint_check(root)
         else:
             value = account_inventory(root)
         print(json.dumps(value, ensure_ascii=False, indent=2))

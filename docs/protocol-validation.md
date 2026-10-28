@@ -116,3 +116,83 @@ P0-A 的 Windows 编译、11 项 Rust 回归和前端构建结果见 [验证记�
 - 固定种子拆包测试覆盖 identity / gzip / deflate × CR / LF / CRLF × 10 种分块，报告与整段输入一致；全部样本为人工数据。
 - 新增离线 `--official-credits` 和 `--summary`，仅核对手工数字；未知、不完整、上游异常或不一致仍退出 2，非法数值安全退出 1，不访问账号。CI 添加人工 SSE 的离线数字核对步骤，远端运行未核验。
 - 上述实现不读取待保存的 Windows 工具、不影响现用 IDE / 代理 / 证书，不代表实机或平台账本交付。人工测试按上表留待用户回来后验证。
+
+## 2026-10-28：Windows 辅助工具回归补齐
+
+`decode_ide_secret()` 的无 BOM UTF-16LE 判据缺陷已修复（原实现对 4 字节切片与 3 字节 NUL 做定长比较，条件恒为 false），改为按奇偶字节的 NUL 分布判断，并把所用编码写入 `safe_decode_metadata.decoded_encoding`。同时修复只读数据库句柄泄漏：`with sqlite3.connect(...)` 只提交事务、不关闭连接，`account_inventory` / `account_check` 改为 `contextlib.closing`，不再持续占用 `state.vscdb`。
+
+`account-check.json` 的 `secret_decode_state` 收敛为四个固定值：`unsupported_container`、`decoded_content_not_supported`、`dpapi_failed`、`decrypted_secret_not_text`；`HTTPError` 显式 `close()`，避免 `-W error` 下的 ResourceWarning。
+
+新增 `server/tests/test_windows_p0.py` 33 项纯离线回归：DPAPI、证书构建、socket 与报告层全部替换为本地假实现，只使用临时目录，不访问真实证书库、账号库或网络。覆盖容器解析（含无 BOM UTF-16LE 回归）、token 提取边界、端点白名单、CONNECT 目标校验、盘点不泄漏取值、多候选不自动验证、CA 身份不完整 / 不匹配 / 过期拒绝，以及 CLI 路径约束与固定失败文案。全量 `python -m unittest discover -s server/tests -q` 为 128 项通过（协议 95 项 + 工具 33 项）；以旧判据做变异校验时新测试 2/2 失败，可确认回归有效。
+
+本机 Python 3.14.8 未安装 `cryptography`，因此 `prepare` / `install` / `tls-check` 的证书与 DPAPI 路径**未在本机重跑**。上表 P0-01 / P0-02 的验收状态不变；无 BOM UTF-16LE 修复后仍需用隔离测试账号的真实容器复测 `candidate_count` 与 `usable_credential_verified`。
+
+## 2026-10-28：本机 Windows 22H2 辅助链路实测
+
+环境：`.local/p0-venv` + `cryptography` 50.0.2；本机无 `E:\Qoder IDE`，实际 Electron 可执行文件为 `%LOCALAPPDATA%\Programs\Qoder\Qoder.exe`（桌面 App，含 `app.asar`）；预检确认 15888 / 15889 空闲、`.local/windows-p0/` 原本为空（不存在遗留测试 CA）。
+
+- `prepare`：生成独立 EC P-256 测试 CA，SHA-256 `f7c5e110…`、指纹 `4F00FE2327E632CBD97DE2A7244860AF5B6EA612`，有效期至 2026-11-27，CA 私钥为当前用户 DPAPI 密文。
+- `install`：写入当前用户 ROOT 后按 SHA-256 精确指纹复核为 true。
+- `tls-check`：loopback CONNECT 与 Windows 默认 CA TLS 通过；`ide_node_default_ca.authorized: false`（`UNABLE_TO_VERIFY_LEAF_SIGNATURE`），仅独立子进程 `NODE_USE_SYSTEM_CA=1` 时为 true。与上轮记录一致，说明该 Electron 默认不读 Windows 用户根库，后续代理方案必须显式注入 `NODE_EXTRA_CA_CERTS` / `NODE_USE_SYSTEM_CA`，否则 IDE 会被自身 TLS 校验拦住。
+- `account-inventory`：`storage.json`（3319 B）无可识别顶层字段；`auth.v1.dat`（554 B）非 JSON；`proxy-tokens.json` 不存在；`state.vscdb` 有 5 条 `secret://`，其中 1 条属 `aicoding.` 且为 `{type: Buffer, data}` 容器，另 2 条 auth 类记录值不是 JSON。用户选择仅盘点，**未跑 `account-check`**，`usable_credential_verified` 保持 false。
+- 全部报告在 `.local/windows-p0/`（已忽略），未发起推理请求、未刷新凭据、未改现用 IDE 配置。
+- 测试 CA 仍在当前用户 ROOT；清理命令：`certutil -user -delstore Root 4F00FE2327E632CBD97DE2A7244860AF5B6EA612`。P0-01 / P0-02 仍需隔离账号的真实对话与官方逐笔消耗才能验收。
+
+## 2026-10-28：桌面 App 凭据容器接入只读验证
+
+上一节“仅盘点”的限制已解除：`account-check` 在本机跑通，并暴露出三处真实缺陷，均已修复并补回归。
+
+- **非目标容器污染状态**：`state.vscdb` 里存在无法解析的 `secret://` 描述和非 `aicoding.` 扩展的密钥行，旧实现让它们参与状态判定，把真正的 Qoder 结果覆盖成 `decoded_content_not_supported_json`。现在描述解析失败或扩展名不符时直接跳过，只有目标行影响 `secret_decode_state`。
+- **`v10` 容器算法错误**：IDE 内那条 Qoder 密钥是 `v10` + AES-256-GCM，旧实现拿纯 DPAPI 去解必然失败（表现为 `dpapi_failed`）。现实现先试纯 DPAPI，失败再按 Chromium 规则用 `Local State` 的 `os_crypt.encrypted_key`（DPAPI 包装的 32 字节密钥）解密。该容器解出 20 字节，内容只有 `{"platform": …}`，**不含 token**。
+- **桌面 App 容器**：`%APPDATA%\com.qoder.app.stable\auth.v1.dat`（554 B，`v10`）同样走 AES-256-GCM，但密钥必须来自**同级目录**的 `Local State`，用 IDE 目录的密钥解会失败。解出 523 字节 JSON，字段为 `authenticationContext / expiresAt / refreshToken / refreshTokenExpiresAt / schemaVersion / token / user`，`token_extractable: true`。
+
+候选选择改为按身份去重：`candidate_count` 是能取出 token 的容器数，`distinct_identity_count` 是不同 token 数；同一 token 只验证一次并优先字段更完整的快照，不同 token 视为不同身份、自动验证被阻塞为 `multiple_distinct_identities`，必须用 `--source` 显式指定。本机两个容器是**两个不同身份**（`com.qoder.app.stable` 有效期至 2026-11-18，`com.qodercn.app.stable` 至 2026-10-29），因此显式指定了有效期更长的前者。
+
+```powershell
+& ".local\p0-venv\Scripts\python.exe" -m server.qoder_cloud.windows_p0 account-check --source com.qoder.app.stable
+```
+
+实测结果：`user_plan` 与 `quota_usage` 均 `http_status: 200` / `valid_json: true`，`upstream_remaining_micro: 743000000`（即 743.0 Credits 剩余），`verified_source: com.qoder.app.stable`，`usable_credential_verified: true`。独立快照写入 `account-snapshot.dpapi`（812 B 的 DPAPI 密文，非明文），解密后的 token 指纹与 `com.qoder.app.stable` 一致、与 CN 容器不同。同一轮 `existing_login_modified: false`、`token_refreshed: false`、`upstream_inference_requests: 0`，未改现用 IDE 配置、未走推理接口。
+
+回归从 128 项扩到 144 项（协议 95 + 工具 49），新增覆盖 `v10` 降级解密、真实 AES-GCM 往返（缺 `cryptography` 时跳过）、桌面容器只读验证、行过滤、同身份去重、身份冲突阻塞、显式 `--source` 与未知来源拒绝；对去重、显式选择、字段优先、来源优先四处逻辑做变异校验均被测试杀死。
+
+本次只证明“只读取凭据 + 官方只读配额查询”可用，并提供了 743.0 Credits 这一官方基线数字。P0-01 / P0-02 仍未验收：还需要隔离账号的一次真实对话，并用同一工具对比请求前后的 `upstream_remaining_micro`，才能证明代理链路上的逐笔消耗与官方口径一致。
+
+## 2026-10-28：实际产品版本、数据目录与端点清单
+
+之前记录的“Qoder IDE 1.37.0”与本机不符，现按安装清单与 `product.json` 重录。
+
+| 产品 | 版本 | 位置 | 其他事实 |
+|---|---|---|---|
+| Qoder IDE | **1.106.3**（quality stable，commit `b98cae7`，2026-10-16） | `D:\Qoder IDE\` | `updateUrl: https://center.qoder.sh/algo`，`dataFolderName: .qoder`，`cliName: qoder` |
+| Qoder 桌面 App | 安装项 **0.4.9**；`.qoder-versions` 已下载 **0.4.11** | `%LOCALAPPDATA%\Programs\Qoder` | `appId: com.qoder.app`、`dataDirectoryName: com.qoder.app.stable`、channel `stable`，更新下载基址 `https://download.qoder.com.cn/qoder-app/releases` |
+| 本仓库旧构建 | Qoder Proxy 1.1.0 | `%LOCALAPPDATA%\Qoder Proxy` | 与本次实机验证无关，未启动 |
+
+两个桌面数据目录的活跃度可以直接量出来，不需要猜：
+
+- `%APPDATA%\com.qoder.app.stable`：**在用**。1698 个文件，`auth.v1.dat` 最后写入 2026-10-27，`main.sqlite` 10.3 MB。
+- `%APPDATA%\com.qodercn.app.stable`：**旧客户端残留**。2636 个文件，最后一次写入 2026-10-12，`main.sqlite` 48 MB，另有 `auth.machine-id`、`chat-session-turn-payload-buffer.sqlite`、`sessionMigration.sqlite` 等只有较新构建才有的文件。
+
+因此上一节显式选 `com.qoder.app.stable` 既符合“有效期更长 / 字段更全”，也符合“目录仍在写入”。工具现在把这条依据固化进排序：字段完整度 → 容器写入时间 → 固定来源顺序，并在报告里输出 `container_modified_at` 与 `data_directory_files` 两个可复查字段。
+
+端点清单来自 IDE 1.106.3 自带文件，不靠抓包：
+
+- `out/vs/code/electron-utility/sharedProcess/sharedProcessMain.js` 的角色常量：`DEFAULT_LOGIN_BASE_URL=https://qoder.com/device/selectAccounts`、`DEFAULT_OPENAPI_BASE_URL=https://openapi.qoder.sh`、`DEFAULT_CENTER_ENDPOINT=https://center.qoder.sh`（大模型）、`DEFAULT_QUEST_SERVER_ENDPOINT=https://qts2.qoder.sh`、`DEFAULT_DYNAMIC_ENDPOINT=https://api2.qoder.sh`。
+- 同一文件里的区域机制：`/algo/api/v2/service/region/endpoints`，缓存文件 `User/region-config-cache.json`，刷新间隔 1800 s，且 `REGION_CACHE_OVERRIDES_STATIC_ENDPOINTS` 允许缓存覆盖上述静态默认值。
+- 本机 `User/region-config-cache.json`（315 B，`fetchTime` = 2026-10-26T05:07:06Z）实际内容：`preferredInferenceNode = https://api3.qoder.sh`、`preferredNesNode = https://api5.qoder.com.cn`、`preferredCodebaseNode = https://api2.qoder.sh`。该缓存已超过刷新周期未更新，说明该次读取时 IDE 近期未联网刷新。
+
+这条证据直接推翻了一个假设：产品默认的 `target_domains`（`center.qoder.sh` + `openapi.qoder.sh`）**并未覆盖真正的推理与补全节点**，所以按旧默认值运行，代理看不到计费流量，P0 逐笔核对无从谈起。已改为四个：`center.qoder.sh`、`openapi.qoder.sh`、`api3.qoder.sh`、`api5.qoder.com.cn`；代码库节点 `api2.qoder.sh` 不计费且请求体会带上整段代码，有意不默认解密。改动在 `src-tauri/src/config.rs`（`DEFAULT_TARGET_DOMAINS` + `default_target_domains()`，`state.rs` 复用同一份）并新增 3 项单元测试。
+
+**该改动已在本机编译验证（2026-10-28）**：1.96.0 工具链原先的 `rust-lib` 只剩元数据桩，`rustc` 连 `fn main` 都过不去；已用镜像源重装该工具链（`rustup toolchain uninstall 1.96.0-x86_64-pc-windows-msvc`，再以 `RUSTUP_DIST_SERVER=https://rsproxy.cn` 执行 `rustup toolchain install 1.96.0-x86_64-pc-windows-msvc --profile minimal --no-self-update`，仅对单次命令生效，未写用户级环境变量）。重装后 `rustc +1.96.0 --version` 与 hello world 均正常，`cargo +1.96.0 test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --lib` 输出 **22 passed; 0 failed**（历史 11 项 + 区域配置 8 项 + 热更新 3 项）。历史记录里的“11 项 Rust 单元测试”仍只能作为旧证据，当前数值以 22 项为准。
+
+`cargo check --all-targets` 会停在 `tauri::generate_context!()`：`frontendDist` 指向的 `../dist` 不存在（本仓库未包含前端构建产物），与本次改动无关；CI 的 `windows-native` job 同样只跑 `--lib`，前端构建由另一个 job 负责。
+
+区域配置可被服务端随时改写，固定四个域名仍会在下一次区域变更时失效。现已改为运行时读取：`config.rs` 新增 `region_cache_path()` / `region_billing_domains()` / `effective_target_domains()`，`state.rs` 的 `AppState::new` 在启动时读缓存并把推理 / 补全节点并入拦截范围。
+
+合并规则有意保留用户意图：名单为空或仍等于产品默认时才并入区域节点；自定义过名单则原样使用，不悄悄加回用户删掉的域名。缓存缺失、不是合法 JSON、端点不是 https、主机名形状不合法时一律返回空表并回退到常量，不猜也不报错。对应 5 项新单测（区域节点并入、定制名单不变、重复去重、只读计费节点、坏缓存返回空），并对“合并条件、去重、https 校验、节点范围”四处做过变异校验，结果 4/4 均被杀死。
+
+运行中也会跟随：`state.rs` 的 `spawn_region_refresh()` 按 1800 秒（与 IDE 自身刷新周期一致）重读缓存，名单变了就热更新 `RequestLogger`，不需要重启代理；缓存消失或读不出计费节点时保持现有名单，不会把拦截范围清空。这项对长时间开着的客户端有意义——否则 IDE 一换节点，代理就静默失效。另加 3 项 `#[tokio::test]`，对“空缓存不覆盖名单”与“不看用户配置”两处变异校验 2/2 被杀死。
+
+新增的 `windows_p0 endpoint-check` 就是这件事的离线部分：它只读同一份缓存，输出每个节点的角色、是否计费、是否已在默认范围内，并给出 `missing_billing_domains` / `unbilled_domains_in_scope` / `suggested_target_domains` 与缓存年龄。2026-10-28 本机实测结果：三个节点分别命中 `api3.qoder.sh`（推理，计费）、`api5.qoder.com.cn`（补全，计费）、`api2.qoder.sh`（代码库，不计费），`within_default_scope: true`、`missing_billing_domains: []`、`unbilled_domains_in_scope: []`；`region_cache_fetched_at` 为 2026-10-26T05:07:06Z，`region_cache_age_seconds: 174607`（约 48.5 小时），因此 `region_cache_stale: true`。也就是说“默认范围覆盖了计费节点”这个结论成立，但依据是两天前的缓存，不能当作当前路由。
+
+该子命令只报告不修改：Python 侧名单与 `src-tauri/src/config.rs` 的 `DEFAULT_TARGET_DOMAINS` 由跨语言一致性测试（读取 `config.rs` 源码比对四个域名）守住，名单漂移会先让测试失败，而不是让线上代理静默少解密。新增 9 项离线回归，全量 159 项通过；新逻辑的四处变异（漂移置空、把代码库计入计费、忽略过期判定、取消 https 校验）均为 4/4 被杀死。

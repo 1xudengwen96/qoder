@@ -144,3 +144,44 @@
 验证结果：Windows Python 3.13.3 下 95 项自动测试全部通过；再次禁用 site 自动加载并将警告视为错误运行，仍为 95 项通过。`git diff --check` 无错误。编辑器语言服务未就绪，未把静态诊断记为通过；远端 CI 与其他 Python / OS 组合仍以实际运行结果为准。
 
 人工夹具核对返回 `matched`、差额 0、125000 微积分，仍仅诊断。真实对话、原生路由、官方逐笔消耗、无账号初始化与跨客户隔离留待有资源时验证；所需条件与步骤已集中登记。没有触碰当前会话、账号、代理或证书，未提交 / 推送。本批不修改 Rust / 前端，也不把 P1–P5 标成完成。
+
+## 2026-10-28：Windows 辅助工具缺陷修复与离线回归
+
+- 修复 `decode_ide_secret()` 的无 BOM UTF-16LE 识别缺陷：原判据对 `clear[1:8:2]` 的 4 字节切片与 3 字节 `b"\x00\x00\x00"` 做定长比较，条件恒为 false，导致该容器落回 UTF-8 解码。现改为按奇偶字节的 NUL 分布判断，并抽出 `secret_text()` 返回所用编码，写入 `safe_decode_metadata.decoded_encoding`。
+- 修复只读数据库句柄泄漏：`with sqlite3.connect(...)` 只提交事务、不关闭连接，`account_inventory` / `account_check` 改用 `contextlib.closing`。原实现在 Windows 下会持续占用 `state.vscdb`，使该文件无法被移动或删除。
+- 收敛错误分类：非 JSON 容器统一为 `ValidationError`；`account-check.json` 的 `secret_decode_state` 只在 `unsupported_container` / `decoded_content_not_supported` / `dpapi_failed` / `decrypted_secret_not_text` 四值中取值；`HTTPError` 显式 `close()`，避免 `-W error` 下的 ResourceWarning。
+- 新增 `server/tests/test_windows_p0.py`（33 项）：DPAPI、证书构建、socket 与报告层全部替换为本地假实现，只使用临时目录，不触碰真实证书库、账号库与网络。覆盖容器解析与无 BOM UTF-16LE 回归、token 提取边界、端点白名单、CONNECT 目标校验、盘点不泄漏取值、多候选不自动验证、CA 身份不完整 / 不匹配 / 过期拒绝，以及 CLI 路径约束与固定失败文案。
+- 验证：`python -m unittest discover -s server/tests -q` 为 128 项通过（原 95 项 + 新增 33 项）；`python -W error -m unittest server.tests.test_windows_p0` 为 33 项通过。另以旧判据做变异校验，新测试 2/2 失败，确认回归能捕获该缺陷。本机 Python 3.14.8，未安装 `cryptography`：证书生成与真实 DPAPI 未在本机执行，实机结论仍以 `docs/protocol-validation.md` 的记录为准。未安装或删除证书、未读取现用账号、未请求上游，未提交 / 推送。
+
+## 2026-10-28：`v10` 容器解密、桌面 App 凭据与候选身份去重
+
+- 修复非目标行污染状态：`state.vscdb` 中无法解析的 `secret://` 描述、非 `aicoding.` 扩展的密钥行不再参与状态判定，只 `continue` 跳过，避免一行畸形记录把真正的 Qoder 结果覆盖成 `decoded_content_not_supported_json`。
+- 修正 `v10` 容器算法：原实现拿纯 DPAPI 解 AES-GCM 密文，必然失败。现拆出 `os_crypt_key()` / `os_crypt_decrypt()`，先试纯 DPAPI，失败再按 Chromium 规则用 `Local State` 里 DPAPI 包装的 32 字节密钥做 AES-256-GCM 解密，并把方案写入 `safe_decode_metadata.container_scheme`（`dpapi` / `os_crypt_aes_gcm`）。
+- 接入桌面 App 凭据：`desktop_auth_containers()` / `decode_desktop_auth()` 只读解密 `%APPDATA%\com.qoder.app.stable` 与 `com.qodercn.app.stable` 下的 `auth.v1.dat`；密钥必须取同级目录的 `Local State`。`account_check()` 不再因 IDE 数据库缺失而提前返回，新增 `desktop_auth_containers`、`decoded_container_type`、`recognized_account_fields`、`token_extractable`。
+- 候选选择改为按身份去重：新增 `select_candidate()` / `candidate_rank()` / `verify_candidate()`，`candidate_count` 为可取出 token 的容器数，`distinct_identity_count` 为不同 token 数；同一 token 只验证一次并优先字段更完整、来源更靠前的快照（`SOURCE_PRIORITY`）；不同 token 视为不同身份，自动验证阻塞为 `multiple_distinct_identities`，需 `--source <label>` 显式指定，来源不存在时为 `requested_source_not_available`。
+- 清理与回归：把只读校验与留档从 `account_check()` 拆到 `verify_candidate()`；测试增至 144 项（协议 95 + 工具 49），新增 `v10` 降级解密、真实 AES-GCM 往返（缺 `cryptography` 时跳过）、桌面容器只读验证、行过滤、同身份去重、身份冲突阻塞、字段完整度优先、显式 `--source` 与未知来源拒绝。
+- 验证：venv（含 `cryptography` 50.0.2）与系统 Python 均 `144` 项通过（系统 Python 跳过 1 项 AES-GCM 用例）；对去重、显式选择、字段优先、来源优先四处逻辑做变异校验，4/4 均被测试杀死。实机 `account-check --source com.qoder.app.stable` 返回 `user_plan` / `quota_usage` 双 200，`upstream_remaining_micro: 743000000`，快照以 DPAPI 密文写入 `.local/windows-p0/account-snapshot.dpapi`，实测细节见 [协议验证记录](protocol-validation.md)。未刷新凭据、未改现用 IDE 配置、未发推理请求，未提交 / 推送。
+
+## 2026-10-28：产品版本核实、候选排序可量化、补全默认解密范围
+
+- 核实实际安装：Qoder IDE **1.106.3**（`D:\Qoder IDE`，commit `b98cae7`，2026-10-16）与桌面 App 安装项 **0.4.9**（`.qoder-versions` 已就位 0.4.11）。旧记录中的 1.37.0 是错的，已在文档更正；未沿用旧版本号。
+- 候选排序不再依赖硬编码名单：`candidate_rank()` 改为字段完整度 → 容器写入时间 → 固定来源顺序，`desktop_auth_containers` 逐项输出 `container_modified_at` 与 `data_directory_files`。本机量得 `com.qoder.app.stable` 在用（1698 文件，2026-10-27 写入），`com.qodercn.app.stable` 为残留（2026-10-12 后未写入）。
+- 新增 `modification_time()` / `iso_mtime()` / `count_files()`，都只读元数据、不读内容；取不到时按最旧处理，不阻断盘点。
+- 从 IDE 自带文件整理端点与角色：`sharedProcessMain.js` 的 `DEFAULT_CENTER_ENDPOINT` / `DEFAULT_OPENAPI_BASE_URL` / `DEFAULT_QUEST_SERVER_ENDPOINT` / `DEFAULT_DYNAMIC_ENDPOINT` / `DEFAULT_LOGIN_BASE_URL`，以及区域机制 `/algo/api/v2/service/region/endpoints` + `User/region-config-cache.json`（刷新 1800 s，可覆盖静态默认值）。本机缓存实为 inference `api3.qoder.sh`、NES `api5.qoder.com.cn`、codebase `api2.qoder.sh`。
+- 据此修正产品默认范围：`src-tauri/src/config.rs` 新增 `DEFAULT_TARGET_DOMAINS` / `default_target_domains()`（center + openapi + api3 + api5），`state.rs` 复用同一份，避免两处名单漂移；`api2.qoder.sh` 有意排除（不计费且带整段代码）。新增 3 项单元测试。
+- 验证：Python 回归 `150` 项通过（协议 95 + 工具 55），新排序键三处变异（字段优先 / 时间优先 / 来源顺序）均被杀死；实机重跑 `account-check --source com.qoder.app.stable` 仍为双 200、基线 `743000000`。**Rust 改动未编译验证**：本机 rustup 1.96.0 的 rust-lib 只剩元数据桩，`rustc` 连 `fn main` 都编译不了，`rustup component remove/add rust-std` 也无法修复（需重装工具链），已在待办中单列。未提交 / 推送。
+
+## 2026-10-28：`endpoint-check` 离线漂移检测
+
+- 新增 `endpoint-check` 子命令：只读 `%APPDATA%\Qoder\User\region-config-cache.json`，输出每个节点的 `role` / `billed` / `in_default_scope`，以及 `missing_billing_domains`、`unbilled_domains_in_scope`、`suggested_target_domains`、缓存年龄，写入 `.local/windows-p0/endpoint-check.json`。只报告漂移，不改配置、不改代理。
+- 缓存年龄取自文件里的 `fetchTime`（毫秒）而不是 mtime，与 IDE 的 1800 s 刷新周期比较，给出 `region_cache_stale`；取不到 `fetchTime` 时保持 `null`，不伪造新鲜度。`endpoint_host()` 只接受 https 且形状合法的域名，`http://` 或非 URL 一律当作空主机，不拿去和默认名单比对。
+- 名单一致性：Python 侧 `DEFAULT_TARGET_DOMAINS` 与 `src-tauri/src/config.rs` 用跨语言测试守卫（直接解析 Rust 源码里的字符串字面量），任一侧改动遗漏都会让测试失败。
+- 验证：新增 9 项离线回归，全量 `159` 项通过（协议 95 + 工具 64，系统 Python 跳过 1 项 AES-GCM）；对漂移置空、把代码库计入计费、忽略过期判定、取消 https 校验四处做变异校验，4/4 均被杀死。本机实测 `within_default_scope: true`、`missing_billing_domains: []`，但 `region_cache_fetched_at` 为 2026-10-26T05:07:06Z、`region_cache_age_seconds: 174607`，`region_cache_stale: true`，所以该结论只能算“两天前的路由”，不能当成当前节点。未提交 / 推送。
+
+## 2026-10-28：修复 Rust 工具链并改为运行时读取区域配置
+
+- 工具链修复：1.96.0 的 `lib\rustlib\...\lib` 为空（只剩清单与元数据桩），`rustc` 连 hello world 都报 `only metadata stub found for rlib dependency core`。彻底卸载后用镜像源重装（`RUSTUP_DIST_SERVER=https://rsproxy.cn` 仅对该条命令生效，`--profile minimal --no-self-update`），重装后 `rustc +1.96.0` 与 `cargo test` 均正常。选用 rsproxy 是因为 `static.rust-lang.org` 直连超时（os error 10060）。
+- 拦截范围改为运行时驱动：`config.rs` 新增 `region_cache_path()` / `region_billing_domains()` / `effective_target_domains()`，从 `%APPDATA%\Qoder\User\region-config-cache.json` 读 `preferredInferenceNode` 与 `preferredNesNode`，`state.rs` 的 `AppState::new` 用它们计算实际拦截名单。`DEFAULT_TARGET_DOMAINS` 降为缓存缺失时的兜底。
+- 合并规则保留用户意图：名单为空或仍等于产品默认时才并入区域节点；用户定制过名单则原样使用。缓存缺失 / 非法 JSON / 非 https / 主机名含非法字符时返回空表，不猜、不报错。主机名解析先剥凭证与端口，再校验字符集。
+- 运行中跟随：`state.rs` 新增 `refresh_from_cache()` / `spawn_region_refresh()`，用 `tauri::async_runtime::spawn` 按 `REGION_REFRESH_SECONDS = 1800` 重读缓存，名单有变化才调 `set_target_domains`；缓存读不出计费节点时直接返回，不清空拦截范围。顺带让原本闲置的 `get_target_domains()` 有了实际用途。
+- 验证：`cargo +1.96.0 test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --lib` 输出 **22 passed; 0 failed**（历史 11 项 + 区域配置 8 项 + 热更新 3 项）；对合并条件、去重、https 校验、节点范围四处做变异校验，加上“空缓存不覆盖名单”与“不看用户配置”共 6/6 均被杀死；`cargo check --all-targets` 因仓库没有前端 `dist` 停在 `tauri::generate_context!()`，与本次改动无关（CI 也只用 `--lib`）。未提交 / 推送。

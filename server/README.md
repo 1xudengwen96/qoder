@@ -4,11 +4,13 @@
 
 ## 运行测试
 
-需要 Python 3.10+，离线协议与数字核对测试不需要第三方依赖。当前 95 项测试全部使用人工数据，不读取 Windows 实测工具或现用账号，也不会安装证书：
+需要 Python 3.10+，离线协议、数字核对与 Windows 辅助工具的测试都不需要第三方依赖。当前 159 项测试全部使用人工数据（协议 95 项 + Windows 辅助工具 64 项），不读取现用账号，也不会安装证书：
 
 ```bash
 python3 -m unittest discover -s server/tests -v
 ```
+
+`server/tests/test_windows_p0.py` 把 DPAPI、证书构建、socket 与报告层全部替换为本地假实现，只使用临时目录，不访问真实证书库、账号库或网络。因此“测试通过”不等于实机链路已验证，实机结论以 [协议验证操作](../docs/protocol-validation.md) 的记录为准。
 
 ## 采样本机响应
 
@@ -85,6 +87,49 @@ python3 -m server.qoder_cloud.probe --input .local/protocol/raw-response.sse.gz 
 缺失 / 非有限 / 负数 / 超过六位精度的官方值被拒绝；数字不一致退出 2，并加 `official_credits_mismatch`。流未结束、快照回退或上游异常时，即使数字相同仍退出 2，状态为 `sample_unconfirmed`。不能通过手工数值消除已有待核对原因。
 
 `--summary` 在 stderr 输出固定诊断字段，stdout 仍为单份 JSON。使用 `--output` 时 JSON 只写入新文件；输出文件不覆盖输入或已有报告。未指定核对 / 摘要选项时维持原有报告接口。
+
+## Windows P0 实机辅助工具
+
+`server.qoder_cloud.windows_p0` 是实机验证辅助脚本，不是代理网关。它生成独立测试 CA、在当前用户根证书库做安装与精确校验、用只允许 loopback 的 CONNECT 辅助代理探测 TLS 信任，并只读盘点账号容器。它不读取对话、不改现用 IDE 配置、不刷新 Token、不请求推理接口；所有报告带 `diagnostic_only: true`，私有数据只写被 Git 忽略的 `.local/windows-p0/`。
+
+只有证书相关子命令依赖 `cryptography`，离线协议工具不依赖它：
+
+```powershell
+python -m venv .local\p0-venv
+& ".local\p0-venv\Scripts\python.exe" -m pip install cryptography
+$PY = ".local\p0-venv\Scripts\python.exe"
+```
+
+| 子命令 | 作用 | 报告 |
+|---|---|---|
+| `prepare` | 生成或复用 EC P-256 测试 CA（CA 私钥以当前用户 DPAPI 保存）与 `CN=localhost` 的 loopback leaf，建立隔离目录与隔离 settings | `preparation.json` |
+| `install` | 把测试 CA 装入当前用户 Root，并按 SHA-256 精确指纹复核 | `certificate-status.json` |
+| `tls-check` | 15888（只放行 `CONNECT 127.0.0.1:15889`）→ 15889 TLS `/health`；可选探测 IDE 的 Electron Node 信任栈 | `loopback-tls.json` |
+| `account-inventory` | 只读盘点 storage.json / auth.v1.dat / proxy-tokens.json / state.vscdb 的存在性与字段名 | `account-inventory.json` |
+| `account-check` | 只读解密 IDE 插件密钥与桌面 App 容器，用官方 plan / quota 接口验证唯一身份，并用 DPAPI 保存独立快照 | `account-check.json` |
+| `endpoint-check` | 只读解析 IDE 区域配置缓存（`Qoder/User/region-config-cache.json`），核对推理 / 补全节点是否都在默认解密范围内，并报告缓存年龄 | `endpoint-check.json` |
+
+```powershell
+& $PY -m server.qoder_cloud.windows_p0 prepare
+& $PY -m server.qoder_cloud.windows_p0 install
+& $PY -m server.qoder_cloud.windows_p0 tls-check --electron "D:\Qoder IDE\Qoder IDE.exe"
+& $PY -m server.qoder_cloud.windows_p0 account-inventory
+& $PY -m server.qoder_cloud.windows_p0 account-check --source com.qoder.app.stable
+& $PY -m server.qoder_cloud.windows_p0 endpoint-check
+```
+
+`--root` 必须位于工作区 `.local/` 下（默认 `.local/windows-p0`），否则直接拒绝；`--electron` 仅 `tls-check` 使用；`--source` 仅 `account-check` 使用。
+
+边界与注意事项：
+
+- `install` 有系统副作用且**没有卸载命令**。结束验证后手工执行 `certutil -user -delstore Root <thumbprint>`，指纹见 `preparation.json` 的 `ca_thumbprint`。
+- `tls-check` 在 IDE 默认 CA 校验失败时**仍可能退出 0**，必须读报告里的 `ide_node_default_ca` / `ide_node_system_ca`。`scope` 固定为 `loopback_helper_not_rust_proxy`，不覆盖 IDE Chromium / 原生请求栈、Rust 代理、云端签名与工具调用链。
+- `account-check.json` 的 `secret_decode_state` 只取四个固定值：`unsupported_container`（容器不识别）、`decoded_content_not_supported`（已解密但不是账号 JSON 或 token）、`dpapi_failed`、`decrypted_secret_not_text`。
+- 候选选择按身份去重：`candidate_count` 是能取出 token 的容器数，`distinct_identity_count` 是不同 token 数。同一 token 出现在多个容器里只验证一次，优先顺序为字段更完整 → 最近写入 → 固定来源顺序；每个容器同时输出 `container_modified_at` 与 `data_directory_files`，用来区分在用目录与旧客户端残留。不同 token 代表不同登录身份，此时不验证、`read_only_checks` 为空并给出 `verification_blocked: multiple_distinct_identities`，必须用 `--source` 明确指定来源（来源名不存在时为 `requested_source_not_available`）。
+- 端口固定为 15888 / 15889 且不启用地址复用，被占用时直接失败。
+- `endpoint-check` 只报告漂移、不改任何配置：`within_default_scope` 为 false 时把 `missing_billing_domains` 补进代理的拦截域名即可；`suggested_target_domains` 保持默认顺序、只在尾部追加。代码库节点（`api2.qoder.sh`）不产生 Credits，不会被建议纳入；反向漂移（把不计费节点写进范围）由 `unbilled_domains_in_scope` 提示。`region_cache_stale` 以缓存里的 `fetchTime` 与 IDE 的 1800 秒刷新周期比较，过旧说明节点名单可能已失效，不能当成当前路由。Python 侧名单与 `src-tauri/src/config.rs` 的 `DEFAULT_TARGET_DOMAINS` 由跨语言一致性测试守卫；代理本身在启动时会读同一份缓存（`region_cache_path()` / `region_billing_domains()` / `effective_target_domains()`），并每 1800 秒后台重读、发现变化就热更新拦截名单；常量只是缓存缺失时的兜底。
+- 报告只含字段名、类型、布尔与计数；密文、Token、原始取值与聊天正文都不会写入。
+- 容器解析支持 Electron `safeStorage` 的 `type: Buffer` 结构、UTF-16（含 / 不含 BOM）与 UTF-8 正文，并支持两种加密方案：纯当前用户 DPAPI，以及 Chromium 系 `v10` + AES-256-GCM（密钥来自同类目录 `Local State` 的 `os_crypt.encrypted_key`，本身由 DPAPI 包装）。桌面 App 的 `auth.v1.dat` 只认 `v10` 方案，且必须用同级目录（`com.qoder.app.stable` / `com.qodercn.app.stable`）的 `Local State` 密钥。两种方案都不识别时按固定原因失败，不做静默解码。
 
 ## 支持范围
 
